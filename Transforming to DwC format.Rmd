@@ -1,5 +1,5 @@
 ---
-title: "Standardizing datasets to DarwinCore format ver. 3 revision 2"
+title: "Standardizing datasets to DarwinCore format ver. 4"
 author: "Germaine Comia Geneta"
 date: "`r Sys.Date()`"
 output:
@@ -22,7 +22,7 @@ Throughout the transformation, we will only use the VectAbundance dataset (https
 
 ```{r paged.print=TRUE}
 # Load your data
-data <- read_csv("vect_trial.csv")
+data <- read_csv("dwc_vect.csv")
 
 # Check data
 head(data, n = 5)
@@ -87,10 +87,16 @@ Identify the columns in the original dataset corresponding to each DwC field. Cr
 eventID <- data$ID
 
 # eventDate
-eventDate <- paste0(
-  as.Date(data$date, format = "%d/%m/%y"),
+eventDate <- data$date
+
+# dateInterval
+dateInterval <- paste0(
+  as.Date(data$date, format = "%d/%m/%y") - 7,
   "/",
-  as.Date(data$date, format = "%d/%m/%y") + 7)
+  as.Date(data$date, format = "%d/%m/%y"))
+
+# startDate
+startDate <- as.Date(eventDate, format = "%d%m%y") - 7
 
 # year
 year <- format(data$date, "%Y")
@@ -235,6 +241,8 @@ dwc_event <- data  |>
   transmute(
     eventID = eventID,
     eventDate = eventDate,
+    dateInterval = dateInterval,
+    startDate = startDate,
     year = year,
     month = month,
     samplingProtocol = samplingProtocol,
@@ -322,6 +330,8 @@ Identify the columns in the original dataset corresponding to each DwC field. Cr
 occurrenceID <- data$ID
 
 # eventDate - previously given
+# dateInterval - previously given
+# startDate - previously given
 
 # basisOfRecord
 basisOfRecord <- data |> 
@@ -397,6 +407,8 @@ dwc_occurrence <- data  |>
   transmute(
     occurrenceID = occurrenceID,
     eventDate = eventDate,
+    dateInterval = dateInterval,
+    startDate = startDate,
     basisOfRecord = basisOfRecord,
     taxonRank = taxonRank,
     scientificName = scientificName,
