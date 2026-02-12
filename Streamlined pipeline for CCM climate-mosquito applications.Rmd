@@ -1,0 +1,1619 @@
+---
+title: "Streamlined pipeline for cross-correlation map applications on climate-mosquito dynamics"
+author: "Germaine Comia Geneta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(countrycode)
+library(sf)
+library(lubridate)
+library(purrr)
+library(scales)
+library(openmeteo)
+library(ropenmeteo)
+library(climwin)
+```
+
+# 0. Set up
+Throughout the transformation, we will only use the VectAbundance dataset from [Da Re et al. (2024)](https://zenodo.org/records/11486198) as a sample dataset. The following objects will be used throughout the script:
+```{r 0}
+# Set the dataset name, this will be used throughout the pipeline
+datasetName <- "VectAbundance_2024"
+
+# Set the maximum time lag, this will be used throughout the pipeline
+maxLag <- 12
+
+# Set output directory to be used for all outputs
+dir.create(datasetName, showWarnings = FALSE)
+```
+
+# 1. DarwinCore harmonization
+The Darwin Core Standard (DwC) is a widely used framework for structuring biodiversity data, including information on biological records, sampling protocols, and their associated metadata, enabling comprehensive documentation of sampling-event or occurrence datasets.
+
+## 1.1 Aedes data setup
+After loading our data, denoted by `data`, we must check the fields that we have.
+```{r 1.1}
+# Load your data
+data_dwc <- read_csv("dwc_vect.csv")
+
+# Check data
+head(data_dwc, n = 5)
+```
+
+## 1.2 Sampling-event dataset harmonization
+*Required DwC fields:*
+
+- eventID 
+- eventDate
+- samplingProtocol
+- samplingSizeValue
+- samplingSizeUnit
+
+*Strongly recommended DwC fields*
+
+- countryCode	 
+- parentEventID	 
+- samplingEffort	 
+- locationID	 
+- decimalLatitude 
+- decimalLongitude 
+- geodeticDatum	 
+- coordinateUncertaintyInMeters	or coordinatePrecision
+- footprintWKT	 
+- occurrenceStatus
+
+However for these datasets, we will be using the following fields in combination with additional fields for easier data manipulation:
+
+- eventID
+- eventDate: as an interval/range
+- year
+- month
+- samplingProtocol
+- samplingSizeUnit: for harmonization, should be in days
+- samplingSizeValue
+- countryCode
+- samplingEffort
+- decimalLatitude 
+- decimalLongitude 
+- geodeticDatum	 
+- coordinatePrecision
+- footprintWKT: when available or applicable
+- habitat: e.g. urban, peri-urban, rural, etc.; when available
+- continent
+- country
+- stateProvince: also the region
+- municipality
+- institutionCode
+- eventRemarks: to document differences in the ovitrap used by each organisms (sections 'Ovitraps characteristics' in the paper)
+
+Inspect the original dataset to ensure the presence and completeness of the fields required by the DwC standard.
+
+### 1.2.1 Map and assign columns
+Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
+
+```{r 1.2.1}
+# eventID
+eventID <- data_dwc$ID
+
+# eventDate
+eventDate <- data_dwc$date
+
+# dateInterval
+dateInterval <- paste0(
+  as.Date(data_dwc$date, format = "%d/%m/%y") - 7,
+  "/",
+  as.Date(data_dwc$date, format = "%d/%m/%y"))
+
+# startDate
+startDate <- as.Date(eventDate, format = "%d%m%y") - 7
+
+# year
+year <- format(data_dwc$date, "%Y")
+
+# month
+month <- format(data_dwc$date, "%B")
+
+# samplingProtocol
+samplingProtocol <- data_dwc$trap_type
+
+# samplingSizeUnit
+samplingSizeUnit <- "days"
+
+#samplingSizeValue
+samplingSizeValue <- 7 
+
+# countryCode
+countryCode <- data_dwc$Country  
+
+# samplingEffort
+samplingEffort <- data_dwc |>
+  transmute(
+    samplingEffort = case_when(
+      Region %in% c("Fier",
+                    "Vlore",
+                    "Tirane",
+                    "Sicily") ~ "1 week of ovitrap laying",
+      Region %in% c("Lushnje",
+                    "Lezhe",
+                    "Cote Azur",
+                    "Autonomous Province of Trento",
+                    "Emilia-Romagna",
+                    "Veneto",
+                    "Canton of Ticino") ~ "2 weeks of ovitrap laying downscaled to 1 week in post-processing", #Note: Kavaje (Tirane) biweekly inspection
+      Region %in% c("Puglia") ~ "every 7-10 days inspection",
+      Region == "Lazio" & year == 2017 ~ "1 week of ovitrap laying",
+      Region == "Lazio" & year != 2017 ~ " 2 weeks of ovitrap laying downscaled to 1 week in post-processing",
+      Region == "Tuscany" & year == 2020 ~ "1 week of ovitrap laying",
+      Region == "Tuscany" & year != 2020 ~ "2 weeks of ovitrap laying downscaled to 1 week in post-processing",
+      TRUE ~ NA_character_  # default for others
+    )
+  ) |>
+  pull(samplingEffort)
+
+# decimalLatitude
+decimalLatitude <- data_dwc$latitude
+
+# decimalLongitude
+decimalLongitude <- data_dwc$longitude
+
+#geodeticDatum
+geodeticDatum <- paste("EPSG", data_dwc$EPSG, sep = ":")
+
+# coordinatePrecision
+coordinatePrecision <- 0.1
+
+# footprintWKT
+footprintWKT <- NA
+
+# habitat
+habitat <- data_dwc |>
+  transmute(
+    habitat = case_when(
+      Region %in% c("Lazio", "Tuscany", "Veneto") ~ "urban, outdoors",
+      TRUE ~ "unknown"  # default for others
+    )
+  ) |>
+  pull(habitat)
+
+# continent
+continent <- data_dwc$Country
+
+# country
+country <- data_dwc$Country
+
+# stateProvince
+stateProvince <- data_dwc$Region
+
+# municipality - not explicitly stated in dataset (stated in paper but aggregated in dataset)
+municipality <- NA
+
+# institutionCode (in this dataset : the column Institute)
+unique(data_dwc$Institute) # to get the unique institute names
+institutionCode <- data_dwc |>
+  transmute(
+    institutionCode = case_when(
+      Institute %in% c("Istituto Zooprofilattico Sperimentale delle Venezie") ~ "IZSVe",
+      Institute %in% c("SUPSI-DACD-IM-ECOVET") ~ "SUPSI",
+      Institute %in% c("Emilia-Romagna Region") ~ "EM",
+      Institute %in% c("Istituto Zooprofilattico Sperimentale Lazio-Toscana") ~ "IZSLT",
+      Institute %in% c("EID Mediterranee") ~ "EID_MED",
+      Institute %in% c("Institute of Public Health Tirana") ~ "ISHP",
+      Institute %in% c("University of Bary") ~ "UNIBA",
+      Institute %in% c("Local Health Care Unit Fier, Institute of Public Health Tirana") ~ "ISHP_FIE",
+      Institute %in% c("Local Health Care Unit Vlore, IInstitute of Public Health Tirana") ~ "ISHP_VLO",
+      Institute %in% c("Istituto Zooprofilattico Sperimentale della Sicilia") ~ "IZSSI",
+      Institute %in% c("Fondazione Museo Civico di Rovereto") ~ "MCR",
+      TRUE ~ NA_character_  # default for others
+    )
+  ) |>
+  pull(institutionCode)
+
+# eventRemarks
+eventRemarks <- data_dwc |>
+  transmute(
+    eventRemarks = case_when(
+      Country == "Italy" & Institute == "University of Bary" ~
+        paste("BPC, tap", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "Fondazione Museo Civico di Rovereto" ~
+        paste("polypropylene", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "MUSE - Museo delle Scienze" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "Emilia-Romagna Region" ~
+        paste("BCPJ, dechlorinated", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "Istituto Zooprofilattico Sperimentale Lazio-Toscana" ~
+        paste("BPC, tap, urban", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "Istituto Zooprofilattico Sperimentale della Sicilia" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      Country == "Italy" & Institute == "Istituto Zooprofilattico Sperimentale delle Venezie" ~
+        paste("BPC, tap, urban", substrate, larvicide_type, sep = ", "),
+      Country == "Switzerland" & Institute == "SUPSI-DACD-IM-ECOVET" ~
+        paste("BPC, tap", substrate, larvicide_type, sep = ", "),
+      Country == "France" & Institute == "EID Mediterranee" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      Country == "Albania" & Institute == "Local Health Care Unit Fier, Institute of Public Health Tirana" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      Country == "Albania" & Institute == "Local Health Care Unit Vlore, Institute of Public Health Tirana" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      Country == "Albania" & Institute == "Institute of Public Health Tirana" ~
+        paste("BPC", substrate, larvicide_type, sep = ", "),
+      TRUE ~ NA_character_
+    )
+  ) |>
+  pull(eventRemarks)
+```
+
+### 1.2.2 Create new dataframe
+Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
+```{r 1.2.2, paged.print=TRUE}
+# Create a new dataframe following DwC.
+dwc_event <- data_dwc  |> 
+  transmute(
+    eventID = eventID,
+    eventDate = eventDate,
+    dateInterval = dateInterval,
+    startDate = startDate,
+    year = year,
+    month = month,
+    samplingProtocol = samplingProtocol,
+    samplingSizeUnit   = samplingSizeUnit,
+    samplingSizeValue  = samplingSizeValue,
+    countryCode = countrycode(countryCode, "country.name.en", "iso2c"),
+    samplingEffort = samplingEffort,
+    decimalLatitude = decimalLatitude,
+    decimalLongitude = decimalLongitude,
+    geodeticDatum = geodeticDatum,
+    coordinatePrecision = coordinatePrecision,
+    footprintWKT = footprintWKT,
+    habitat = habitat,
+    continent = continent,
+    country = country,
+    stateProvince = stateProvince,
+    municipality = municipality,
+    institutionCode = institutionCode,
+    eventRemarks = eventRemarks)
+print(dwc_event)
+
+# Save as .csv file
+write.csv(dwc_event, file = file.path(datasetName, paste0(datasetName, "_event.csv")), row.names = FALSE)
+```
+
+## 1.3 Occurrence dataset harmonization
+*Required DwC fields:*
+
+- occurrenceID
+- basisOfRecord
+- scientificName
+- eventDate
+
+*Strongly recommended DwC fields:*
+
+- countryCode
+- taxonRank
+- kingdom
+- decimalLatitude
+- decimalLongitude
+- geodeticDatum
+- coordinateUncertaintyInMeters	 
+- individualCount
+- organismQuantity
+- organismQuantityType
+
+*Fields to be shared if available:*
+
+- informationWithheld
+- dataGeneralizations
+- eventTime
+- country
+
+Selected fields will be included in the occurrence dataset in combination with other additional fields:
+
+- occurrenceID: generally different from eventID (multiple occurrenceID for 1 eventID); in this case, they are similar (only 1 occurrence for 1 event)
+- eventDate
+- basisOfRecord
+- taxonRank: to what level the organism was identified
+- scientificName: should be provided according to a standard nomenclature
+- nameAccordingTo: source or basis of scientificName
+- genericName: informal name
+- countryCode
+- decimalLatitude 
+- decimalLongitude
+- geodeticDatum
+- coordinatePrecision
+- footprintWKT
+- individualCount
+- organismQuantity
+- organismQuantityType
+- lifeStage
+- occurrenceRemarks
+
+### 1.3.1 Map and assign columns
+Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
+```{r 1.3.1, paged.print=TRUE}
+# occurrenceID
+occurrenceID <- data_dwc$ID
+
+# eventDate - previously given
+# dateInterval - previously given
+# startDate - previously given
+
+# basisOfRecord
+basisOfRecord <- data_dwc |> 
+  transmute(
+    basisOfRecord = case_when(
+      trap_type %in% c("ovitrap") ~ "HumanObservation",
+      TRUE ~ NA_character_ 
+    )
+  ) |> 
+  pull(basisOfRecord)
+  
+# taxonRank
+taxonRank <- data_dwc |> 
+  transmute(
+    taxonRank = case_when(
+      !is.na(species) & species != "" ~ "species",
+      !is.na(genus)   & genus   != "" ~ "genus",
+      !is.na(family)  & family  != "" ~ "family",
+      !is.na(order)   & order   != "" ~ "order",
+      !is.na(class)   & class   != "" ~ "class",
+      !is.na(phylum)  & phylum  != "" ~ "phylum",
+      !is.na(kingdom) & kingdom != "" ~ "kingdom",
+      TRUE ~ NA_character_
+    )
+  ) |> 
+  pull(taxonRank)
+
+# scientificName
+scientificName <- "Aedes albopictus (Skuse, 1895)"
+
+# nameAccordingTo
+nameAccordingTo <- "Integrated Taxonomic Information System, https://www.itis.gov/, accessed on 9 january 2025"
+
+# genericName
+genericName <- paste(data_dwc$genus, data_dwc$species, sep = " ")
+
+# countryCode - previously given
+# decimalLatitude - previously given
+# decimalLongitude - previously given
+# geodeticDatum - previously given
+# coordinatePrecision - previously given
+# footprintWKT - previously given
+
+# individualCount
+individualCount <- data_dwc$value
+
+# organismQuantity
+organismQuantity <- data_dwc$value
+
+# organismQuantityType
+organismQuantityType <- ifelse(
+  !is.na(data_dwc$value) & data_dwc$value != "",
+  "individuals",
+  NA_character_
+)
+
+# lifeStage
+lifeStage <- data_dwc$life_stage
+
+# occurrenceRemarks
+occurrenceRemarks <- ifelse(
+  is.na(data_dwc$value),
+  "dry/overturned ovitrap; masonite stick not considered",
+  NA_character_
+)
+```
+
+### 1.3.2 Create new dataframe
+Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
+```{r 1.3.2, paged.print=TRUE}
+# Create a new dataframe following DwC.
+dwc_occurrence <- data_dwc  |> 
+  transmute(
+    occurrenceID = occurrenceID,
+    eventDate = eventDate,
+    dateInterval = dateInterval,
+    startDate = startDate,
+    basisOfRecord = basisOfRecord,
+    taxonRank = taxonRank,
+    scientificName = scientificName,
+    nameAccordingTo = nameAccordingTo,
+    genericName = genericName,
+    countryCode = countrycode(countryCode, "country.name.en", "iso2c"),
+    decimalLatitude = decimalLatitude,
+    decimalLongitude = decimalLongitude,
+    geodeticDatum = geodeticDatum,
+    coordinatePrecision = coordinatePrecision,
+    footprintWKT = footprintWKT,
+    individualCount = individualCount,
+    organismQuantity = organismQuantity,
+    organismQuantityType = organismQuantityType,
+    lifeStage = lifeStage,
+    occurrenceRemarks = occurrenceRemarks)
+print(dwc_occurrence)
+
+# Save as .csv file
+write.csv(dwc_occurrence, file = file.path(datasetName, paste0(datasetName, "_occurrence.csv")), row.names = FALSE)
+```
+
+## 1.4 Metadata dataset harmonization
+*DwC fields:*
+
+- type
+- modified
+- language
+- license
+- rightsHolder
+- accessRights
+- bibliographicCitation
+- references
+- feedbackURL
+- institutionID
+- collectionID
+- datasetID
+- institutionCode
+- collectionCode
+- datasetName
+- ownerInstitutionCode
+- basisOfRecord
+- informationWithheld
+- dataGeneralizations
+- dynamicProperties
+
+From the dataset and accompanying [journal article](https://doi.org/10.1038/s41597-024-03482-y), we will try to extract information and compile into a record-level metadataset. Only fields above that have the available data will be included.
+
+Inspect the original dataset to ensure the presence and completeness of the fields required by the DwC standard.
+
+### 1.4.1 Map and assign columns
+Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
+```{r 1.4.1}
+# type
+type <- "Dataset"
+
+# modified
+modified <- 2024-09-24
+
+# language
+language <- "en"
+
+# license
+license <- "http://creativecommons.org/licenses/by/4.0/"
+
+# rightsHolder
+
+# accessRights
+accessRights <- "https://www.nature.com/articles/s41597-024-03482-y#additional-information:~:text=Reprints%20and%20permissions"
+
+# bibliographicCitation
+bibliographicCitation <- "Daniele Da Re. (2024). VectAbundace v0.1.5 [Data set]. Zenodo. https://doi.org/10.5281/zenodo.11486198"
+
+# references
+references <- "https://doi.org/10.1038/s41597-024-03482-y"
+
+# feedbackURL
+feedbackURL <- data_dwc$DOI_website
+
+# institutionID
+institutionID <- data_dwc$Institute
+
+# collectionID
+
+# datasetID - user-defined
+datasetID <- "Ae_albo_VA2024"
+
+# institutionCode - previously given
+
+# collectionCode
+
+# datasetName
+datasetName <- "VectAbundance_2024"
+
+# ownerInstitutionCode
+
+# basisOfRecord - previously given
+
+# informationWithheld
+informationWithheld <- "Not raw records, post-processed"
+
+# dataGeneralizations
+dataGeneralizations <- "Downscaled to 1 week, Aggregated coordinates to center point of 9x9km grid"
+
+# dynamicProperties
+dynamicProperties <- NA
+```
+
+### 1.4.2 Create new dataframe
+Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
+```{r 1.4.2}
+# Create a new dataframe binding all fields
+dwc_metadata <- data_dwc  |> 
+  transmute(
+    datasetID = datasetID,
+    datasetName = datasetName,
+    type = type,
+    modified = as.Date(modified, format = "%d/%m/%Y"),
+    language = language,
+    license = license,
+    accessRights = accessRights,
+    bibliographicCitation = bibliographicCitation,
+    references = references,
+    feedbackURL = feedbackURL,
+    institutionID = institutionID,
+    institutionCode = institutionCode,
+    basisOfRecord = basisOfRecord,
+    informationWithheld = informationWithheld,
+    dataGeneralizations = dataGeneralizations,
+    dynamicProperties = dynamicProperties)
+print(dwc_metadata)
+
+# Save as .csv file
+write.csv(dwc_metadata, file = file.path(datasetName, paste0(datasetName, "_metadata.csv")), row.names = FALSE)
+```
+
+# 2. Create general dataframe
+For the next steps, we will only be using one dataframe so as not to call from different files. 
+
+Obtaining climate data requires the following:
+
+- rowID
+- siteID
+- start date of collection
+- end date or collection date
+- latitude and longitude coordinates
+
+Constructing CCMs requires the following:
+
+- rowID
+- siteID
+- date of collection
+- population measure (e.g. trap counts)
+- daily climate data
+- latitude and longitude coordinates
+- region or country, for larger scale datasets
+
+```{r 2}
+from_event <- dwc_event |> 
+  transmute(
+    rowID = row_number(),
+    startDate = as.Date(startDate),
+    endDate = as.Date(eventDate),
+    lat = decimalLatitude,
+    long = decimalLongitude,
+    region = stateProvince
+  )
+
+from_occ <- dwc_occurrence |> 
+  transmute(
+    rowID = row_number(),
+    count = as.numeric(individualCount),
+  )
+
+data_all <- left_join(from_event, from_occ, by = "rowID")
+
+# Identify unique sites and assign siteID
+sites <- data_all |> 
+  distinct(lat, long) |> 
+  mutate(siteID = row_number())
+
+# Add to dataframe
+data_all <- data_all |> 
+  left_join(sites, by = c("lat", "long"))
+
+# Our mother dataset
+data_all
+```
+
+# 3. Climate data download using OpenMeteo
+
+## 3.1 Divide into batches by site and year
+```{r 3.1}
+# Load our mother dataset
+data_clim <- data_all
+
+# Set which variable to retrieve
+daily <- "temperature_2m_mean"
+
+# Create a new output directory
+outdir_clim <- file.path(datasetName, "clim_daily", daily)
+dir.create(outdir_clim, recursive = TRUE, showWarnings = FALSE)
+
+# Identify start and end dates per site
+siteDates <- data_clim |> 
+  group_by(siteID, lat, long, region) |> 
+  summarise(
+    siteStart = min(startDate, na.rm = TRUE), # earliest sampling start
+    siteEnd   = max(endDate,   na.rm = TRUE), # latest trap date
+    .groups = "drop"
+  )  |> 
+  mutate(
+    startLag = siteStart - weeks(maxLag), # lag-adjusted start
+    yearStart = year(startLag), # full calendar years for requests
+    yearEnd = year(siteEnd)
+  )
+siteDates
+
+# Create site batches based on years
+siteBatch <- siteDates |> 
+  rowwise() |> 
+  mutate(years = list(seq(yearStart, yearEnd))) |> 
+  unnest(years) |> 
+  ungroup() |> 
+  transmute(
+    siteID, lat, long, region,
+    batchStart = as.character(as.Date(paste0(years, "-01-01"))),
+    batchEnd = as.character(as.Date(paste0(years, "-12-31")))
+  )
+siteBatch
+```
+
+## 3.2 Retrieve climate data by batch
+```{r 3.2, echo=TRUE, message=TRUE, warning=FALSE}
+unlink("openmeteo_cache", recursive = TRUE)
+dir.create("openmeteo_cache", showWarnings = FALSE)
+
+cachePath <- function(siteID, start, end) {
+  file.path("openmeteo_cache", paste0("site_", siteID, "__", start, "__", end, ".rds"))
+}
+
+retrieveBatchCached <- function(lat, long, start, end, siteID,
+                                region = NULL,
+                                maxTries = 8,
+                                baseWait = 0.8,
+                                maxWait  = 60) {
+  f <- cachePath(siteID, start, end)
+  if (file.exists(f)) return(readRDS(f)) # If already downloaded, load from disk
+  wait <- baseWait
+  for (k in seq_len(maxTries)) {
+    Sys.sleep(wait)
+    out <- tryCatch(
+      weather_history( # function from openmeteo package
+        location = c(lat, long),
+        start = start,
+        end   = end,
+        daily = daily #CHECK THISSSSS
+      ),
+      error = function(e) e
+    )
+    if (!inherits(out, "error")) {
+      out$siteID <- siteID
+      out$region <- region
+      out$batchStart <- start
+      out$batchEnd <- end
+      saveRDS(out, f)
+      return(out)
+    }
+    msg <- conditionMessage(out)
+    message("FAILED siteID=", siteID, " ", start, " to ", end, " try=", k, " : ", msg)
+    if (grepl("429", msg)) {
+      wait <- min(max(wait * 2, 2), maxWait)
+    } 
+    else {wait <- min(wait * 1.5, maxWait)}
+  }
+  message("GAVE UP siteID=", siteID, " ", start, " to ", end)
+  NULL
+}
+
+climList <- map(seq_len(nrow(siteBatch)), \(i) {
+  retrieveBatchCached(
+    lat   = siteBatch$lat[i],
+    long  = siteBatch$long[i],
+    start = siteBatch$batchStart[i],
+    end   = siteBatch$batchEnd[i],
+    siteID = siteBatch$siteID[i],
+    region = siteBatch$region[i]
+  )
+})
+
+climSites <- bind_rows(compact(climList))
+
+# Save as .csv for backup
+write.csv(climSites, file = file.path(outdir_clim, paste0(datasetName, "_clim.csv")), row.names = FALSE)
+```
+
+## 3.3 Compile into a table, with spatial data
+Before continuing onto this step, check `climSites`for exact column name of climate variable.
+```{r 3.3}
+# Create dataframe
+if ("date" %in% names(climSites)) {
+  climDaily <- climSites |>
+    mutate(date = as.Date(date)) |>
+    transmute(
+      siteID,
+      region,
+      date,
+      mean_temp = daily_temperature_2m_mean # change accordingly
+    )
+  } else {
+  dateCol <- intersect(names(climSites), c("time", "datetime", "date_raw"))[1] # fallback if date column is named differently
+  if (is.na(dateCol)) {
+    stop(
+      "Could not find a usable date column in climSites. Columns are: ",
+      paste(names(climSites), collapse = ", ")
+    )
+  }
+
+  climDaily <- climSites |> 
+    rename(dateRaw = all_of(dateCol)) |>
+    mutate(date = as.Date(dateRaw)) |>
+    transmute(
+      siteID,
+      region,
+      date,
+      mean_temp = daily_temperature_2m_mean)
+}
+
+# De-duplicate overlapping year chunks
+climDaily <- climDaily |>
+  distinct(siteID, date, .keep_all = TRUE) |>
+  arrange(siteID, date)
+
+climDailySpatial <- climDaily |>
+  left_join(sites, by = "siteID") |> 
+  mutate(date = as.Date(date))
+
+# Save as .csv
+write.csv(climDailySpatial, file = file.path(outdir_clim, paste0(datasetName, "_climSpatial.csv")), row.names = FALSE)
+
+# Check if all values are present
+message("Missing climate values: ", sum(is.na(climDailySpatial$mean_temp)))
+```
+# 4. Data visualization
+Now that we have two timeseries (ovitrap data and climate data), we can overlay them and observe trends. We will use the dataframe climDailySpatial from the Climate data download script.
+
+## 4.1 Check alignment of siteIDs
+```{r 4.1, echo=TRUE, message=TRUE}
+# Assign to a new dataframe
+vis_clim <- climDailySpatial
+vis_bio <- data_all |> transmute(
+  date = as.Date(endDate),
+  count,
+  lat,
+  long,
+  region,
+  siteID)
+
+# CHECKPOINT
+vis_clim |>  filter(siteID == 123)  |>  distinct(lat, long)  |>  head()
+vis_bio  |>  filter(siteID == 123) |> distinct(lat, long) |>  head()
+# If not aligned:
+siteMap <- vis_clim |> distinct(siteID, lat, long)
+vis_bio <- vis_bio |> left_join(site_map, by = c("lat", "long"))
+
+# Create output directories
+dir.create(file.path(datasetName, "vis_siteplots"), showWarnings = FALSE)
+dir.create(file.path(datasetName, "vis_regionplots"), showWarnings = FALSE)
+
+# Assign a caption for compiled per site plots
+captionTxt <- "Left axis: Counts (blue). Right axis: Mean temperature (°C) (red). X-axis: Month-Year." # change accordingly
+```
+
+## 4.2 Build plots per site
+``` {r 4.2}
+# Map site -> region (one region per site)
+siteRegionMap <- vis_clim |> 
+  distinct(siteID, region)
+
+siteIDs <- sort(intersect(unique(vis_bio$siteID), unique(vis_clim$siteID)))
+
+# Store in a list
+plotsBySite <- vector("list", length(siteIDs))
+names(plotsBySite) <- as.character(siteIDs)
+
+for (sid in siteIDs) {
+  siteRegion <- siteRegionMap |>
+    filter(siteID == sid) |>
+    pull(region) |>
+    first()
+  
+  bioM <- vis_bio |>
+    filter(siteID == sid) |>
+    mutate(month = floor_date(date, "month")) |>
+    group_by(month) |>
+    summarise(count = sum(count, na.rm = TRUE), .groups = "drop")
+  
+  climM <- vis_clim |>
+    filter(siteID == sid) |>
+    mutate(month = floor_date(date, "month")) |>
+    group_by(month) |>
+    summarise(mean_temp = mean(mean_temp, na.rm = TRUE), .groups = "drop")
+  
+  if (nrow(bioM) == 0) next
+  
+  countStart <- min(bioM$month, na.rm = TRUE)
+  countEnd   <- max(bioM$month, na.rm = TRUE)
+  
+  plotStart <- countStart - weeks(maxLag)
+  plotEnd   <- countEnd
+  
+  bioM  <- bioM  |> filter(month >= plotStart, month <= plotEnd)
+  climM <- climM |> filter(month >= plotStart, month <= plotEnd)
+  
+  
+  df <- full_join(bioM, climM, by = "month") |>  arrange(month)
+  if (all(is.na(df$count)) || all(is.na(df$mean_temp))) next
+  
+  scale_factor <- max(df$count, na.rm = TRUE) / max(df$mean_temp, na.rm = TRUE)
+  
+  plotsBySite[[as.character(sid)]] <-
+    ggplot(df, aes(x = month)) +
+    geom_line(aes(y = count), color = "steelblue") +
+    geom_point(aes(y = count), color = "steelblue", size = 0.4) +
+    geom_line(aes(y = mean_temp * scale_factor), color = "firebrick") +
+    geom_point(aes(y = mean_temp * scale_factor), color = "firebrick", size = 0.4) +
+    scale_x_date(date_breaks = "6 months", date_labels = "%b%Y") +  # Jan2020
+    scale_y_continuous(
+      name = NULL,
+      sec.axis = sec_axis(~ . / scale_factor, name = NULL)
+    ) +
+    labs(title = paste("Site", sid), x = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(
+      axis.text.x  = element_text(angle = 45, hjust = 1, size = 6),
+      axis.text.y.left  = element_text(angle = 90, vjust = 0.5, hjust = 0.5, size  = 6), # rotate left y-axis
+      axis.text.y.right = element_text(angle = -90, vjust = 0.5, hjust = 0.5, size  = 6), # rotate right y-axis
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      plot.title   = element_text(size = 10)
+    )
+}
+
+# Save site plots as .png
+for (sid in names(plotsBySite)) {
+  p <- plotsBySite[[sid]]
+  if (is.null(p)) next
+  
+  ggsave(filename = file.path(datasetName, "vis_siteplots", paste0("site_", sid, ".png")),
+    plot = p, width = 7, height = 4, dpi = 300)
+}
+```
+
+## 4.3 Compile site plots per region
+```{r 4.3}
+# Check sites per region (optional diagnostic)
+siteRegionMap |>
+  count(region, name = "n_sites") |>
+  arrange(desc(n_sites))
+
+# Helpers for layout and size
+plotSizeFromLayout <- function(ncol, nrow) { # landscape-biased figure size
+  list(width  = max(8, ncol * 4),
+       height = max(4, nrow * 2.5))
+}
+
+layoutFromN <- function(n) { # layout rules based only on number of sites
+  if (n == 1) {
+    list(ncol = 1, nrow = 1)
+  } else if (n == 2) {
+    list(ncol = 1, nrow = 2)
+  } else if (n == 3) {
+    list(ncol = 1, nrow = 3)          # 3 rows of 1
+  } else if (n == 4) {
+    list(ncol = 2, nrow = 2)
+  } else if (n <= 6) {
+    list(ncol = 2, nrow = 3)
+  } else if (n <= 9) {
+    list(ncol = 3, nrow = 3)
+  } else if (n <= 12) {
+    list(ncol = 3, nrow = 4)          # 12 = 4 rows of 3
+  } else if (n >= 13 && n <= 15) {
+    list(ncol = 3, nrow = 5)          # 13–15 = 5 rows of 3
+  } else if (n == 16) {
+    list(ncol = 4, nrow = 4)          # 16 = 4x4
+  } else {
+    list(ncol = 2, nrow = 4, paginate = TRUE, page_size = 8) # paginate large regions
+  }
+}
+
+chunkList <- function(x, n) { # split list into pages
+  split(x, ceiling(seq_along(x) / n))
+}
+
+# Save compiled site plots per region
+plotsByRegion <- split(siteRegionMap$siteID, siteRegionMap$region)
+
+for (reg in names(plotsByRegion)) {
+  
+  sids <- as.character(plotsByRegion[[reg]])
+  regionPlots <- plotsBySite[sids]
+  regionPlots <- regionPlots[!vapply(regionPlots, is.null, logical(1))]
+  
+  if (length(regionPlots) == 0) next
+  
+  safeReg <- gsub("[^A-Za-z0-9]", "_", reg)
+  n <- length(regionPlots)
+  layout <- layoutFromN(n)
+  size <- plotSizeFromLayout(layout$ncol, layout$nrow)
+  
+  # -------- paginated regions --------
+  if (!is.null(layout$paginate) && layout$paginate) {
+    
+    pages <- chunkList(regionPlots, layout$page_size)
+    
+    for (pg in seq_along(pages)) {
+      
+      pRegion <-
+        wrap_plots(pages[[pg]], ncol = layout$ncol, nrow = layout$nrow) +
+        plot_annotation(
+          title = paste0(reg, " (page ", pg, "/", length(pages), ")"),
+          caption = captionTxt
+        )
+      
+      ggsave(filename = file.path(datasetName, "vis_siteplots", paste0(safeReg, "_page_", pg, ".png")),
+        plot   = pRegion, width  = size$width, height = size$height, dpi = 300)
+    }
+    
+    # -------- single-page regions --------
+  } else {
+    
+    pRegion <-
+      wrap_plots(regionPlots, ncol = layout$ncol, nrow = layout$nrow) +
+      plot_annotation(title = reg, caption = captionTxt)
+    
+    ggsave(filename = file.path(datasetName, "vis_siteplots", paste0(safeReg, ".png")),
+      plot   = pRegion, width  = size$width, height = size$height, dpi    = 300)
+  }
+}
+```
+## 4.4 Build plots per region, from aggregated site data
+Mean values will be plotted, with the shadow or ribbons representing the mean ± SD across sites.
+```{r 4.4}
+# Aggregate monthly counts per site
+bioSiteM <- vis_bio |>
+  filter(!is.na(siteID)) |>
+  mutate(month = floor_date(date, "month")) |>
+  group_by(region, siteID, month) |>
+  summarise(count = sum(count, na.rm = TRUE), .groups = "drop")
+
+# Aggregate monthly climate data per site
+climSiteM <- vis_clim |>
+  mutate(month = floor_date(date, "month")) |>
+  group_by(region, siteID, month) |>
+  summarise(mean_temp = mean(mean_temp, na.rm = TRUE), .groups = "drop")
+
+# Apply per-site window: show temp from (first count month - maxLag weeks) to last count month
+siteWindows <- bioSiteM |>
+  group_by(region, siteID) |>
+  summarise(
+    countStart = min(month, na.rm = TRUE),
+    countEnd   = max(month, na.rm = TRUE),
+    plotStart  = countStart - weeks(maxLag),
+    plotEnd    = countEnd,
+    .groups = "drop"
+  )
+
+bioSiteM <- bioSiteM |>
+  left_join(siteWindows, by = c("region", "siteID")) |>
+  filter(month >= plotStart, month <= plotEnd) |>
+  select(region, siteID, month, count)
+
+climSiteM <- climSiteM |>
+  left_join(siteWindows, by = c("region", "siteID")) |>
+  filter(month >= plotStart, month <= plotEnd) |>
+  select(region, siteID, month, mean_temp)
+
+# Region-level monthly summary across sites: line/points = mean; ribbon/shadow = mean ± SD across sites
+bioRegM <- bioSiteM |>
+  group_by(region, month) |>
+  summarise(countMean = mean(count, na.rm = TRUE),
+            countSD   = sd(count,   na.rm = TRUE),
+            nSites    = n_distinct(siteID),
+    .groups = "drop")
+
+climRegM <- climSiteM |>
+  group_by(region, month) |>
+  summarise(
+    climMean = mean(mean_temp, na.rm = TRUE),
+    climSD   = sd(mean_temp,   na.rm = TRUE),
+    nSites   = n_distinct(siteID),
+    .groups = "drop")
+
+# One plot per region (all years combined), Mean across sites + SD shadow, X-axis: months (every 4 months) + year separators
+regions <- sort(intersect(unique(bioRegM$region), unique(climRegM$region)))
+
+for (reg in regions) {
+  
+  b <- bioRegM  |> filter(region == reg)
+  c <- climRegM |> filter(region == reg)
+  
+  df <- full_join(b, c, by = c("region", "month")) |>
+    arrange(month)
+  
+  if (nrow(df) == 0) next
+  if (all(is.na(df$countMean)) || all(is.na(df$climMean))) next
+  
+  # scale temperature to count axis (per region)
+  scale_factor <- max(df$countMean, na.rm = TRUE) /
+    max(df$climMean, na.rm = TRUE)
+  
+  # ---- x-axis breaks ----
+  xMin <- min(df$month, na.rm = TRUE)
+  xMax <- max(df$month, na.rm = TRUE)
+  
+  break4Mo <- seq(floor_date(xMin, "month"),
+                  ceiling_date(xMax, "month"),
+                  by = "4 months")
+  
+  breakYear <- seq(floor_date(xMin, "year"),
+                   ceiling_date(xMax, "year"),
+                   by = "1 year")
+  
+  yearLines <- breakYear
+  
+  p <- ggplot(df, aes(x = month)) +
+    
+    geom_vline( # year separators
+    xintercept = yearLines, linetype = "dashed", linewidth = 0.3, color = "grey50") +
+    geom_ribbon( # counts: SD shadow + mean
+      aes(ymin = pmax(0, countMean - countSD), ymax = countMean + countSD,
+          fill = "Mean trap counts ± SD"), alpha = 0.18) +
+    geom_line(aes(y = countMean, color = "Mean trap counts"), linewidth = 0.6) +
+    geom_point(aes(y = countMean, color = "Mean trap counts"), size = 0.4) +
+    geom_ribbon( # temp: SD shadow + mean (scaled)
+                 aes(ymin = (climMean - climSD) * scale_factor,
+                     ymax = (climMean + climSD) * scale_factor,
+                     fill = "Mean temperature ± SD"), alpha = 0.12) +
+    geom_line(aes(y = climMean * scale_factor, color = "Mean temperature"), linewidth = 0.6) +
+    geom_point(aes(y = climMean * scale_factor, color = "Mean temperature"), size = 0.4) +
+    scale_color_manual( # manual color scale
+      values = c("Mean trap counts"  = "steelblue", "Mean temperature"  = "firebrick"), name = NULL) +
+    scale_fill_manual(values = c("Mean trap counts ± SD" = "steelblue", "Mean temperature ± SD" = "firebrick"), name = NULL) +
+    scale_x_date( # x axes
+      breaks = break4Mo, date_labels = "%b", expand = c(0, 0), 
+      sec.axis = dup_axis(breaks = breakYear, labels = date_format("%Y"), name = NULL)) +
+    scale_y_continuous( # y axes
+      name = "Ovitrap counts", sec.axis = sec_axis(~ . / scale_factor, name = "Mean temperature (°C)")) +
+    guides(color = guide_legend(order = 1, ncol = 1, override.aes = list(linewidth = 0.8, alpha = 1)),
+           fill  = guide_legend(order = 2, ncol = 1, override.aes = list(color = NA))) +
+    labs(title = paste0(reg, " (across ", b$n_sites, " sites)"), x = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x.bottom = element_text(size = 8),
+      axis.text.x.top    = element_text(size = 11, face = "bold"),
+      axis.ticks.x.top   = element_blank(),
+      axis.text.y.left = element_text( # rotate tick labels inward
+        angle = 90, vjust = 0.5, hjust = 0.5, size  = 8),
+      axis.text.y.right = element_text(angle = -90, vjust = 0.5, hjust = 0.5, size  = 8),
+      plot.title = element_text(face = "bold"),
+      legend.position = c(0.02, 0.98),
+      legend.justification = c("left", "top"),
+      legend.box = "horizontal", # put the two guides side-by-side
+      legend.box.background = element_rect( # IMPORTANT: make a single box around BOTH guides
+        fill = alpha("white", 0.75),
+        color = "grey70"),
+      legend.background = element_blank(), # IMPORTANT: remove per-guide background so you don't see "two boxes"
+      legend.text = element_text(size = 6.5),
+      legend.key.size = unit(0.4, "lines"),
+      legend.spacing.x = unit(0.35, "lines"),
+      legend.spacing.y = unit(0.10, "lines"),
+      legend.margin = margin(4, 4, 4, 4))
+  safeReg <- gsub("[^A-Za-z0-9]", "_", reg)
+  ggsave(filename = file.path(datasetName, "vis_regionplots", paste0("region_", safeReg, ".png")),
+    plot   = p, width  = 12, height = 5, dpi    = 300)
+}
+```
+# 5A. Cross-correlation mapping with climwin package
+Cross-correlation maps or CCMs allow us to visualize lagged correlation between two timeseries data, which in this case are climate variables and mosquito ovitrap counts. Introduced by Curriero et al. in 2005, CCMs are capable of
+measuring the correlations between population responses and environmental variables over extended time intervals, rather than a single point in time.
+
+In this script, we will be using the `climwin` package by [Bailey and van de Pol (2016)](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0167980#sec001). This script is part of a pipeline for cross-correlation mapping of mosquito population responses and climate data.
+
+## 5A.1 Set parameters and load data
+Our biological dataframe needs to contain at least the population measure, which is trap counts for the VectAbundance dataset from [Da Re et al. (2024)](https://zenodo.org/records/11486198) and the date of the response. The climate dataframe must have the variable measure and the dates. For batching and analysis purposes, other geographic information such as latitude, longitude, and region were also included.
+
+It is important to note that the climate data can be provided at a daily resolution and correlated at a weekly interval. The `slidingwin` function has an argument `stat` which summarizes the climate data.
+```{r 5A.1}
+# Load climate data
+# Use vis_clim
+
+# Load biological data (trap counts)
+# Use vis_bio
+
+# CHECKPOINT
+message("Sites in clim: ", n_distinct(vis_clim$siteID))
+message("Sites in bio : ", n_distinct(vis_bio$siteID))
+message("Bio rows with missing siteID: ", sum(is.na(vis_bio$siteID)))
+
+# Set parameters
+cinterval <- "week"
+range     <- c(8, 0)
+type      <- "relative"
+stat      <- "mean"
+func      <- "lin"
+
+# Create output directories
+outdir_ccm <- file.path(datasetName, "CCM_siteplots")
+dir.create(outdir_ccm, recursive = TRUE, showWarnings = FALSE)
+outdir_ccmreg <- file.path(datasetName, "CCM_regionplots")
+dir.create(outdir_ccmreg, recursive = TRUE, showWarnings = FALSE)
+```
+
+## 5A.2 Create batches per site
+First we will create CCMs per site. Ensure that the siteID is aligned for both dataframes.
+```{r 5A.2, message=TRUE}
+# Aggregate per site per date
+ccm_bio <- vis_bio |>
+   filter(!is.na(region), !is.na(siteID), !is.na(date), !is.na(count)) |>
+   group_by(region, siteID, date) |>
+   summarise(count = mean(count), .groups = "drop") |>
+   arrange(region, siteID, date)
+ 
+ccm_clim <- vis_clim |>
+   filter(!is.na(region), !is.na(siteID), !is.na(date), !is.na(mean_temp)) |>
+   group_by(region, siteID, date) |>
+   summarise(mean_temp = mean(mean_temp), .groups = "drop") |>
+   arrange(region, siteID, date)
+```
+
+## 5A.3. Create a function to run slidingwin per site
+```{r 5A.3}
+runCCMSite <- function(sid) {
+  climSub <- ccm_clim |> filter(siteID == sid) |> arrange(date)
+  bioSub  <- ccm_bio  |> filter(siteID == sid) |> arrange(date)
+  
+  if (nrow(climSub) < 30 || nrow(bioSub) < 2) {message("SKIP site ", sid, ": insufficient data")
+    return(NULL)}
+  
+  bioSub <- bioSub |> # ensure lag coverage
+    filter(date >= min(climSub$date) + weeks(range[1]),
+           date <= max(climSub$date))
+  
+  if (nrow(bioSub) < 2) {message("SKIP site ", sid, ": insufficient lagged bio") 
+    return(NULL)}
+   
+   baseline <- glm(count ~ 1, data = bioSub) # the baseline or null model 
+   
+   win <- tryCatch(
+     slidingwin(
+       xvar      = list(mean_temp = climSub$mean_temp), # CHECK THE VARIABLE NAME
+       cdate     = climSub$date,
+       bdate     = bioSub$date,
+       baseline  = baseline,
+       type      = type,
+       range     = range,
+       cinterval = cinterval,
+       stat      = stat,
+       func      = func),
+     error = function(e) {message("FAILED site ", sid, ": ", conditionMessage(e)) 
+       return(NULL)}
+   )
+   
+   if (is.null(win) || length(win) == 0) return(NULL)
+   list(siteID = sid,
+        win    = win)
+   }
+```
+
+## 5A.4. Run CCM function per site and save
+```{r 5A.4, message=TRUE, include=FALSE}
+# Run function
+ccmSites <- sort(unique(ccm_bio$siteID))
+ 
+ccmBySite <- map(ccmSites, runCCMSite)
+names(ccmBySite) <- paste0("site_", ccmSites)
+ccmBySite <- compact(ccmBySite)
+
+# CHECKPOINT
+message("CCMs produced: ", length(ccmBySite))
+```
+
+## 5A.5 Create per site plots and save
+```{r 5A.5}
+# Create plots
+for (nm in names(ccmBySite)) {
+  
+  message("Processing ", nm)
+  
+  ccm_a <- ccmBySite[[nm]] # extracting the dataset
+  ccm_b <- ccm_a[["win"]]
+  ds    <- ccm_b[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) {message("  SKIP ", nm, ": invalid dataset")
+    next}
+  
+  sid <- gsub("^site_", "", nm)
+  
+  bestBetaRow <- ds |> # find the BEST rows (highest beta, lowest deltaAICc)
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  betaLabel <- paste0( # Beta plot legend labels
+    "Model beta\n",
+    "r(", bestBetaRow$WindowOpen, ", ",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3))
+  
+  deltaLabel <- paste0( # Delta plot legend labels
+    expression(Delta*AICc), "\n",
+    "r(", bestDeltaRow$WindowOpen, ", ",
+    bestDeltaRow$WindowClose, ") = ",
+    round(bestDeltaRow$deltaAICc, 2))
+  
+  # Plotting beta coefficients
+  plot_b <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = betaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestBetaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA,
+      color = "black",
+      linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_beta.png")), plot = plot_b,
+    width = 8, height = 6, dpi = 300)
+  
+  # Plotting deltaAICc
+  plot_d <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = deltaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestDeltaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA,
+      color = "black",
+      linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_delta.png")), plot = plot_d,
+    width = 8, height = 6, dpi = 300)
+  
+  message( # CHECKPOINT
+    "  saved site ", sid,
+    " | best beta r(", bestBetaRow$WindowOpen, ",",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3),
+    " | best delta = ",
+    round(bestDeltaRow$deltaAICc, 2))
+}
+
+message( # CHECKPOINT
+  "DONE. Files written: ",
+  length(list.files(outdir_ccm, pattern = "\\.png$")))
+```
+
+## 5A.6. Combine per site plots into one plot
+We will then combine the site beta plot and site deltaAICc plot into one layout.
+```{r 5A.6, message=TRUE}
+# Combine per site plots
+for (nm in names(ccmBySite)) {
+  
+  message("Processing combined plot ", nm)
+  
+  ccm_a <- ccmBySite[[nm]]
+  ccm_b <- ccm_a[["win"]]
+  ds    <- ccm_b[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) next
+  
+  sid <- gsub("^site_", "", nm)
+
+  bestBetaRow <- ds |> # Identify best rows to match factor levels
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |> # ensure highlight rows use SAME factor levels as ds
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestTitle <- paste0("Site ", sid," (", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ")")
+  
+  # Plotting beta coefficient subplot
+  p_beta <- plotbetas(dataset = ds) + 
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = "Model beta") +
+    labs(title = paste0("Beta linear (", round(bestBetaRow$ModelBeta, 3), ")")) +
+    geom_tile(data = bestBetaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1) +
+    scale_x_discrete(name = NULL) + # only 1 set of labels for the plot
+    scale_y_discrete(name = "Window open (weeks)")
+  
+  # Plotting delta AICc subplot
+  p_delta <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = expression(Delta*AICc)) +
+    labs(title = paste0("\u0394AICc (", round(bestDeltaRow$deltaAICc, 2), ") compared to null model")) +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1) +
+    theme( # remove duplicated y axis text/ticks/label on the right subplot
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()) +
+    scale_x_discrete(name = NULL) + # remove x label here; we'll set it once via patchwork annotation
+    scale_y_discrete(name = NULL)
+  
+  # Combine the subplots
+  p_combined <- (p_beta | p_delta) +
+    plot_annotation(
+      title = bestTitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", hjust = 0.5)
+      )
+    ) &
+    theme(plot.margin = margin(5.5, 5.5, 5.5, 5.5))
+  
+  p_combined <- p_combined + 
+    plot_annotation(caption = "Window close (weeks)") & # Add a single x-axis label for the whole combined plot
+    theme(
+      plot.caption = element_text(hjust = 0.5, size = 11, face = "bold"),
+      plot.caption.position = "plot")
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_combined.png")),
+    plot   = p_combined,
+    width  = 12,
+    height = 6,
+    dpi    = 300)
+  
+  # CHECKPOINT
+  message("  saved combined plot for site ", sid)
+}
+
+# CHECKPOINT
+message(
+  "DONE. Files written: ",
+  length(list.files(outdir_ccm, pattern = "\\.png$")))
+```
+
+## 5A.7 Create batches per region
+Now we will create CCMs at a larger spatial scale. We will first obtain the mean of each variable for all sites, and then apply the same process as the site CCMs.
+```{r 5A.7, message=TRUE}
+# Aggregate per region = mean across sites WITH data that day
+ccm_bioR <- ccm_bio |>
+  group_by(region, date) |>
+  summarise(
+    count = mean(count, na.rm = TRUE), # get the mean trap count per region
+    n_sites = n_distinct(siteID),
+    .groups = "drop"
+  ) |>
+  arrange(region, date)
+
+ccm_climR <- ccm_clim |>
+  group_by(region, date) |>
+  summarise(
+    mean_temp = mean(mean_temp, na.rm = TRUE), # get the mean daily temp per region
+    n_sites = n_distinct(siteID),
+    .groups = "drop"
+  ) |>
+  arrange(region, date)
+
+# CHECKPOINT
+message("Regions in bioRegion : ", n_distinct(ccm_bioR$region))
+message("Regions in climRegion: ", n_distinct(ccm_climR$region))
+
+ccm_bioR |> count(region) |> arrange(desc(n))
+ccm_climR |> count(region) |> arrange(desc(n))
+```
+
+## 5A.8 Create a function to run CCMs per region
+Ensure that the correct variable is entered in the xvar argument of `slidingwin`.
+```{r 5A.8, message=TRUE}
+# Create function
+runCCMRegion <- function(reg) {
+  
+  climSub <- ccm_climR |> filter(region == reg) |> arrange(date)
+  bioSub  <- ccm_bioR  |> filter(region == reg) |> arrange(date)
+  
+  if (nrow(climSub) < 30 || nrow(bioSub) < 2) {
+    message("SKIP region ", reg, ": insufficient data")
+    return(NULL)}
+  
+  bioSub <- bioSub |> # ensure lag coverage + within climate span
+    filter(
+      date >= min(climSub$date) + weeks(range[1]),
+      date <= max(climSub$date))
+  
+  if (nrow(bioSub) < 2) {
+    message("SKIP region ", reg, ": insufficient lagged bio")
+    return(NULL)}
+  
+  baseline <- glm(count ~ 1, data = bioSub) # our baseline or null model
+  
+  win <- tryCatch(
+    slidingwin(
+      xvar      = list(mean_temp = climSub$mean_temp), # CHECK VARIABLE
+      cdate     = climSub$date,
+      bdate     = bioSub$date,
+      baseline  = baseline,
+      type      = type,
+      range     = range,
+      cinterval = cinterval,
+      stat      = stat,
+      func      = func
+    ),
+    error = function(e) {
+      message("FAILED region ", reg, ": ", conditionMessage(e))
+      return(NULL)}
+  )
+  if (is.null(win) || length(win) == 0) return(NULL)
+  list(region = reg, win = win)
+}
+```
+
+## 5A.9 Run CCM function per region
+```{r 5A.9, message=TRUE}
+# Run function
+ccmRegions <- sort(unique(na.omit(ccm_bioR$region)))
+
+ccmByRegion <- map(ccmRegions, runCCMRegion)
+names(ccmByRegion) <- paste0("region_", ccmRegions)
+ccmByRegion <- compact(ccmByRegion)
+
+# CHECKPOINT 
+message("CCMs produced (regions): ", length(ccmByRegion))
+```
+
+## 5A.10 Create per region plots
+Plot beta and deltaAICc results separately, and then together.
+```{r 5A.10, message=TRUE}
+# Save plots per region (beta, delta, combined)
+for (nm in names(ccmByRegion)) {
+  
+  message("Processing ", nm)
+  
+  reg <- ccmByRegion[[nm]]$region
+  win <- ccmByRegion[[nm]]$win
+  ds  <- win[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) {
+    message("  SKIP ", nm, ": invalid dataset")
+    next}
+
+  bestBetaRow <- ds |> # find BEST rows (highest beta, lowest delta AICc)
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  safeReg <- gsub("[^A-Za-z0-9]+", "_", reg) # region name for file names
+  
+  betaLabel <- paste0( # legend labels for beta plots
+    "Model beta\n",
+    "r(", bestBetaRow$WindowOpen, ", ",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3))
+  
+  deltaLabel <- paste0( # legend labels for delta plots
+    "\u0394AICc\n",
+    "r(", bestDeltaRow$WindowOpen, ", ",
+    bestDeltaRow$WindowClose, ") = ",
+    round(bestDeltaRow$deltaAICc, 2))
+  
+  # Plotting beta coefficient by region
+  plot_b <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = betaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestBetaRow,
+              aes(x = WindowClose, y = WindowOpen), fill = NA, color = "black", linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_beta.png")), plot = plot_b,
+    width = 8, height = 6, dpi = 300)
+  
+  # Plotting deltaAICc per region
+  plot_d <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = deltaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_delta.png")), plot = plot_d, 
+    width = 8, height = 6, dpi = 300)
+  
+  # Combined plots
+  bestTitle <- paste0(reg, " (", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ")")
+  
+  p_beta <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = "Model beta") +
+    labs(title = paste0("Beta linear (", round(bestBetaRow$ModelBeta, 3), ")")) +
+    geom_tile(data = bestBetaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA, color = "black", linewidth = 1) +
+    scale_x_discrete(name = NULL) +
+    scale_y_discrete(name = "Window open (weeks)")
+  
+  p_delta <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = expression(Delta*AICc)) +
+    labs(title = paste0("\u0394AICc (", round(bestDeltaRow$deltaAICc, 2), ") compared to null model")) +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+      fill = NA, color = "black", linewidth = 1) +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()
+    ) +
+    scale_x_discrete(name = NULL) +
+    scale_y_discrete(name = NULL)
+  
+  p_combined <- (p_beta | p_delta) +
+    plot_annotation(
+      title = bestTitle,
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5))) +
+    plot_annotation(caption = "Window close (weeks)") &
+    theme(
+      plot.caption = element_text(hjust = 0.5, size = 11, face = "bold"),
+      plot.caption.position = "plot")
+  
+  ggsave( # save png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_combined.png")),
+    plot   = p_combined,
+    width  = 12,
+    height = 6,
+    dpi    = 300)
+  
+  message( #CHECKPOINT
+    "  saved region ", reg,
+    " | best beta r(", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3),
+    " | best delta = ",
+    round(bestDeltaRow$deltaAICc, 2))
+}
+
+# CHECKPOINT
+message("DONE. Region beta files: ", length(list.files(outdir_ccmreg, pattern = "\\_beta.png$")))
+message("DONE. Region delta files: ", length(list.files(outdir_ccmreg, pattern = "\\_delta.png$")))
+message("DONE. Region combined files: ", length(list.files(outdir_ccmreg, pattern = "\\_combined.png$")))
+```
