@@ -1,0 +1,553 @@
+---
+title: "Cross-correlation mapping using climwin R package ver. 1"
+author: "Germaine Comia Geneta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(climwin)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+```
+# Introduction
+Cross-correlation maps or CCMs allow us to visualize lagged correlation between two timeseries data, which in this case are climate variables and mosquito ovitrap counts. Introduced by Curriero et al. in 2005, CCMs are capable of
+measuring the correlations between population responses and environmental variables over extended time intervals, rather than a single point in time.
+
+In this script, we will be using the `climwin` package by [Bailey and van de Pol (2016)](https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0167980#sec001). This script is part of a pipeline for cross-correlation mapping of mosquito population responses and climate data.
+
+# 1. Set parameters and load data
+Our biological dataframe needs to contain at least the population measure, which is trap counts for the VectAbundance dataset from [Da Re et al. (2024)](https://zenodo.org/records/11486198) and the date of the response. The climate dataframe must have the variable measure and the dates. For batching and analysis purposes, other geographic information such as latitude, longitude, and region were also included.
+
+It is important to note that the climate data can be provided at a daily resolution and correlated at a weekly interval. The `slidingwin` function has an argument `stat` which summarizes the climate data.
+```{r 1, include=FALSE}
+# Set datasetName
+datasetName <- "VectAbundance_2024"
+
+# Set parameters of the function
+cinterval <- "week"
+range     <- c(8, 0)
+type      <- "relative"
+stat      <- "mean"
+func      <- "lin"
+
+# Load climate data
+clim <- read_csv("VectAbundance_2024_climSpatial.csv") |>
+  mutate(date = as.Date(date))
+
+# Load biological data (trap counts)
+bio1 <- read_csv("VectAbundance_2024_occurrence.csv")
+bio2 <- read_csv("VectAbundance_2024_event.csv")
+bio <- bio2 |> # combine required biological data into one df
+   transmute(
+     date = as.Date(eventDate),
+     lat  = decimalLatitude,
+     long = decimalLongitude,
+     region = stateProvince
+   ) |>
+   mutate(count = as.numeric(bio1$individualCount))
+
+# Create output directory
+outdir_ccm <- file.path(datasetName, "CCM_siteplots")
+dir.create(outdir_ccm, recursive = TRUE, showWarnings = FALSE)
+outdir_ccmreg <- file.path(datasetName, "CCM_regionplots")
+dir.create(outdir_ccmreg, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Create batches per site
+First we will create CCMs per site. Ensure that the siteID is aligned for both dataframes.
+```{r 2, message=TRUE}
+# Align siteID from both dataframes
+site_map <- clim |> distinct(siteID, lat, long, region)
+bio <- bio |> left_join(site_map, by = c("lat", "long", "region"))
+ 
+# CHECKPOINT
+message("Sites in clim: ", n_distinct(clim$siteID))
+message("Sites in bio : ", n_distinct(bio$siteID))
+message("Bio rows with missing siteID: ", sum(is.na(bio$siteID)))
+ 
+# Aggregate per site per date
+ccm_bio <- bio |>
+   filter(!is.na(region), !is.na(siteID), !is.na(date), !is.na(count)) |>
+   group_by(region, siteID, date) |>
+   summarise(count = mean(count), .groups = "drop") |>
+   arrange(region, siteID, date)
+ 
+ccm_clim <- clim |>
+   filter(!is.na(region), !is.na(siteID), !is.na(date), !is.na(mean_temp)) |>
+   group_by(region, siteID, date) |>
+   summarise(mean_temp = mean(mean_temp), .groups = "drop") |>
+   arrange(region, siteID, date)
+```
+
+# 3. Create a function to run slidingwin per site
+```{r 3}
+runCCMSite <- function(sid) {
+  climSub <- ccm_clim |> filter(siteID == sid) |> arrange(date)
+  bioSub  <- ccm_bio  |> filter(siteID == sid) |> arrange(date)
+  
+  if (nrow(climSub) < 30 || nrow(bioSub) < 2) {message("SKIP site ", sid, ": insufficient data")
+    return(NULL)}
+  
+  bioSub <- bioSub |> # ensure lag coverage
+    filter(date >= min(climSub$date) + weeks(range[1]),
+           date <= max(climSub$date))
+  
+  if (nrow(bioSub) < 2) {message("SKIP site ", sid, ": insufficient lagged bio") 
+    return(NULL)}
+   
+   baseline <- glm(count ~ 1, data = bioSub) # the baseline or null model 
+   
+   win <- tryCatch(
+     slidingwin(
+       xvar      = list(mean_temp = climSub$mean_temp), # CHECK THE VARIABLE NAME
+       cdate     = climSub$date,
+       bdate     = bioSub$date,
+       baseline  = baseline,
+       type      = type,
+       range     = range,
+       cinterval = cinterval,
+       stat      = stat,
+       func      = func),
+     error = function(e) {message("FAILED site ", sid, ": ", conditionMessage(e)) 
+       return(NULL)}
+   )
+   
+   if (is.null(win) || length(win) == 0) return(NULL)
+   list(siteID = sid,
+        win    = win)
+   }
+```
+
+# 4. Run CCM function per site and save
+```{r 4, message=TRUE, include=FALSE}
+# Run function
+ccmSites <- sort(unique(ccm_bio$siteID))
+ 
+ccmBySite <- map(ccmSites, runCCMSite)
+names(ccmBySite) <- paste0("site_", ccmSites)
+ccmBySite <- compact(ccmBySite)
+
+# CHECKPOINT
+message("CCMs produced: ", length(ccmBySite))
+```
+
+# 5. Create per site plots and save
+```{r 5}
+# Create plots
+for (nm in names(ccmBySite)) {
+  
+  message("Processing ", nm)
+  
+  ccm_a <- ccmBySite[[nm]] # extracting the dataset
+  ccm_b <- ccm_a[["win"]]
+  ds    <- ccm_b[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) {message("  SKIP ", nm, ": invalid dataset")
+    next}
+  
+  sid <- gsub("^site_", "", nm)
+  
+  bestBetaRow <- ds |> # find the BEST rows (highest beta, lowest deltaAICc)
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  betaLabel <- paste0( # Beta plot legend labels
+    "Model beta\n",
+    "r(", bestBetaRow$WindowOpen, ", ",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3))
+  
+  deltaLabel <- paste0( # Delta plot legend labels
+    expression(Delta*AICc), "\n",
+    "r(", bestDeltaRow$WindowOpen, ", ",
+    bestDeltaRow$WindowClose, ") = ",
+    round(bestDeltaRow$deltaAICc, 2))
+  
+  # Plotting beta coefficients
+  plot_b <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = betaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestBetaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA,
+      color = "black",
+      linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_beta.png")), plot = plot_b,
+    width = 8, height = 6, dpi = 300)
+  
+  # Plotting deltaAICc
+  plot_d <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = deltaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestDeltaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA,
+      color = "black",
+      linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_delta.png")), plot = plot_d,
+    width = 8, height = 6, dpi = 300)
+  
+  message( # CHECKPOINT
+    "  saved site ", sid,
+    " | best beta r(", bestBetaRow$WindowOpen, ",",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3),
+    " | best delta = ",
+    round(bestDeltaRow$deltaAICc, 2))
+}
+
+message( # CHECKPOINT
+  "DONE. Files written: ",
+  length(list.files(outdir_ccm, pattern = "\\.png$")))
+```
+
+# 6. Combine per site plots into one plot
+We will then combine the site beta plot and site deltaAICc plot into one layout.
+```{r 6, message=TRUE}
+# Combine per site plots
+for (nm in names(ccmBySite)) {
+  
+  message("Processing combined plot ", nm)
+  
+  ccm_a <- ccmBySite[[nm]]
+  ccm_b <- ccm_a[["win"]]
+  ds    <- ccm_b[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) next
+  
+  sid <- gsub("^site_", "", nm)
+
+  bestBetaRow <- ds |> # Identify best rows to match factor levels
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |> # ensure highlight rows use SAME factor levels as ds
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestTitle <- paste0("Site ", sid," (", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ")")
+  
+  # Plotting beta coefficient subplot
+  p_beta <- plotbetas(dataset = ds) + 
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = "Model beta") +
+    labs(title = paste0("Beta linear (", round(bestBetaRow$ModelBeta, 3), ")")) +
+    geom_tile(data = bestBetaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1) +
+    scale_x_discrete(name = NULL) + # only 1 set of labels for the plot
+    scale_y_discrete(name = "Window open (weeks)")
+  
+  # Plotting delta AICc subplot
+  p_delta <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = expression(Delta*AICc)) +
+    labs(title = paste0("\u0394AICc (", round(bestDeltaRow$deltaAICc, 2), ") compared to null model")) +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1) +
+    theme( # remove duplicated y axis text/ticks/label on the right subplot
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()) +
+    scale_x_discrete(name = NULL) + # remove x label here; we'll set it once via patchwork annotation
+    scale_y_discrete(name = NULL)
+  
+  # Combine the subplots
+  p_combined <- (p_beta | p_delta) +
+    plot_annotation(
+      title = bestTitle,
+      theme = theme(
+        plot.title = element_text(face = "bold", hjust = 0.5)
+      )
+    ) &
+    theme(plot.margin = margin(5.5, 5.5, 5.5, 5.5))
+  
+  p_combined <- p_combined + 
+    plot_annotation(caption = "Window close (weeks)") & # Add a single x-axis label for the whole combined plot
+    theme(
+      plot.caption = element_text(hjust = 0.5, size = 11, face = "bold"),
+      plot.caption.position = "plot")
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccm, paste0("site_", sid, "_combined.png")),
+    plot   = p_combined,
+    width  = 12,
+    height = 6,
+    dpi    = 300)
+  
+  # CHECKPOINT
+  message("  saved combined plot for site ", sid)
+}
+
+# CHECKPOINT
+message(
+  "DONE. Files written: ",
+  length(list.files(outdir_ccm, pattern = "\\.png$")))
+```
+
+# 7. Create batches per region
+Now we will create CCMs at a larger spatial scale. We will first obtain the mean of each variable for all sites, and then apply the same process as the site CCMs.
+```{r 7, message=TRUE}
+# Aggregate per region = mean across sites WITH data that day
+ccm_bioR <- ccm_bio |>
+  group_by(region, date) |>
+  summarise(
+    count = mean(count, na.rm = TRUE), # get the mean trap count per region
+    n_sites = n_distinct(siteID),
+    .groups = "drop"
+  ) |>
+  arrange(region, date)
+
+ccm_climR <- ccm_clim |>
+  group_by(region, date) |>
+  summarise(
+    mean_temp = mean(mean_temp, na.rm = TRUE), # get the mean daily temp per region
+    n_sites = n_distinct(siteID),
+    .groups = "drop"
+  ) |>
+  arrange(region, date)
+
+# CHECKPOINT
+message("Regions in bioRegion : ", n_distinct(ccm_bioR$region))
+message("Regions in climRegion: ", n_distinct(ccm_climR$region))
+
+ccm_bioR |> count(region) |> arrange(desc(n))
+ccm_climR |> count(region) |> arrange(desc(n))
+```
+# 8. Create a function to run CCMs per region
+Ensure that the correct variable is entered in the xvar argument of `slidingwin`.
+```{r 8, message=TRUE}
+# Create function
+runCCMRegion <- function(reg) {
+  
+  climSub <- ccm_climR |> filter(region == reg) |> arrange(date)
+  bioSub  <- ccm_bioR  |> filter(region == reg) |> arrange(date)
+  
+  if (nrow(climSub) < 30 || nrow(bioSub) < 2) {
+    message("SKIP region ", reg, ": insufficient data")
+    return(NULL)}
+  
+  bioSub <- bioSub |> # ensure lag coverage + within climate span
+    filter(
+      date >= min(climSub$date) + weeks(range[1]),
+      date <= max(climSub$date))
+  
+  if (nrow(bioSub) < 2) {
+    message("SKIP region ", reg, ": insufficient lagged bio")
+    return(NULL)}
+  
+  baseline <- glm(count ~ 1, data = bioSub) # our baseline or null model
+  
+  win <- tryCatch(
+    slidingwin(
+      xvar      = list(mean_temp = climSub$mean_temp), # CHECK VARIABLE
+      cdate     = climSub$date,
+      bdate     = bioSub$date,
+      baseline  = baseline,
+      type      = type,
+      range     = range,
+      cinterval = cinterval,
+      stat      = stat,
+      func      = func
+    ),
+    error = function(e) {
+      message("FAILED region ", reg, ": ", conditionMessage(e))
+      return(NULL)}
+  )
+  if (is.null(win) || length(win) == 0) return(NULL)
+  list(region = reg, win = win)
+}
+```
+
+# 9. Run CCM function per region
+```{r 9, message=TRUE}
+# Run function
+ccmRegions <- sort(unique(na.omit(ccm_bioR$region)))
+
+ccmByRegion <- map(ccmRegions, runCCMRegion)
+names(ccmByRegion) <- paste0("region_", ccmRegions)
+ccmByRegion <- compact(ccmByRegion)
+
+# CHECKPOINT 
+message("CCMs produced (regions): ", length(ccmByRegion))
+```
+
+# 10. Create per region plots
+Plot beta and deltaAICc results separately, and then together.
+```{r 10, message = TRUE}
+# Save plots per region (beta, delta, combined)
+for (nm in names(ccmByRegion)) {
+  
+  message("Processing ", nm)
+  
+  reg <- ccmByRegion[[nm]]$region
+  win <- ccmByRegion[[nm]]$win
+  ds  <- win[[1]]$Dataset
+  
+  if (!is.data.frame(ds) || nrow(ds) == 0) {
+    message("  SKIP ", nm, ": invalid dataset")
+    next}
+
+  bestBetaRow <- ds |> # find BEST rows (highest beta, lowest delta AICc)
+    filter(!is.na(ModelBeta)) |>
+    arrange(desc(ModelBeta), WindowOpen, WindowClose) |>
+    slice(1)
+  
+  bestDeltaRow <- ds |>
+    filter(!is.na(deltaAICc)) |>
+    arrange(deltaAICc, WindowOpen, WindowClose) |>
+    slice(1)
+  
+  ds <- ds |> # discrete windows
+    mutate(
+      WindowOpen  = factor(WindowOpen),
+      WindowClose = factor(WindowClose))
+  
+  bestBetaRow <- bestBetaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  bestDeltaRow <- bestDeltaRow |>
+    mutate(
+      WindowOpen  = factor(WindowOpen,  levels = levels(ds$WindowOpen)),
+      WindowClose = factor(WindowClose, levels = levels(ds$WindowClose)))
+  
+  safeReg <- gsub("[^A-Za-z0-9]+", "_", reg) # region name for file names
+  
+  betaLabel <- paste0( # legend labels for beta plots
+    "Model beta\n",
+    "r(", bestBetaRow$WindowOpen, ", ",
+    bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3))
+  
+  deltaLabel <- paste0( # legend labels for delta plots
+    "\u0394AICc\n",
+    "r(", bestDeltaRow$WindowOpen, ", ",
+    bestDeltaRow$WindowClose, ") = ",
+    round(bestDeltaRow$deltaAICc, 2))
+  
+  # Plotting beta coefficient by region
+  plot_b <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = betaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestBetaRow,
+              aes(x = WindowClose, y = WindowOpen), fill = NA, color = "black", linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_beta.png")), plot = plot_b,
+    width = 8, height = 6, dpi = 300)
+  
+  # Plotting deltaAICc per region
+  plot_d <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = deltaLabel) +
+    scale_x_discrete(name = "Window close (weeks)") +
+    scale_y_discrete(name = "Window open (weeks)") +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+              fill = NA, color = "black", linewidth = 1)
+  
+  ggsave( # save as png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_delta.png")), plot = plot_d, 
+    width = 8, height = 6, dpi = 300)
+  
+  # Combined plots
+  bestTitle <- paste0(reg, " (", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ")")
+  
+  p_beta <- plotbetas(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = "Model beta") +
+    labs(title = paste0("Beta linear (", round(bestBetaRow$ModelBeta, 3), ")")) +
+    geom_tile(data = bestBetaRow,
+      aes(x = WindowClose, y = WindowOpen),
+      fill = NA, color = "black", linewidth = 1) +
+    scale_x_discrete(name = NULL) +
+    scale_y_discrete(name = "Window open (weeks)")
+  
+  p_delta <- plotdelta(dataset = ds) +
+    scale_fill_gradientn(colours = c("#6699E6", "white", "#F24D66"), name = expression(Delta*AICc)) +
+    labs(title = paste0("\u0394AICc (", round(bestDeltaRow$deltaAICc, 2), ") compared to null model")) +
+    geom_tile(data = bestDeltaRow, aes(x = WindowClose, y = WindowOpen),
+      fill = NA, color = "black", linewidth = 1) +
+    theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank()
+    ) +
+    scale_x_discrete(name = NULL) +
+    scale_y_discrete(name = NULL)
+  
+  p_combined <- (p_beta | p_delta) +
+    plot_annotation(
+      title = bestTitle,
+      theme = theme(plot.title = element_text(face = "bold", hjust = 0.5))) +
+    plot_annotation(caption = "Window close (weeks)") &
+    theme(
+      plot.caption = element_text(hjust = 0.5, size = 11, face = "bold"),
+      plot.caption.position = "plot")
+  
+  ggsave( # save png
+    filename = file.path(outdir_ccmreg, paste0(safeReg, "_combined.png")),
+    plot   = p_combined,
+    width  = 12,
+    height = 6,
+    dpi    = 300)
+  
+  message( #CHECKPOINT
+    "  saved region ", reg,
+    " | best beta r(", bestBetaRow$WindowOpen, ",", bestBetaRow$WindowClose, ") = ",
+    round(bestBetaRow$ModelBeta, 3),
+    " | best delta = ",
+    round(bestDeltaRow$deltaAICc, 2))
+}
+
+# CHECKPOINT
+message("DONE. Region beta files: ", length(list.files(outdir_ccmreg, pattern = "\\_beta.png$")))
+message("DONE. Region delta files: ", length(list.files(outdir_ccmreg, pattern = "\\_delta.png$")))
+message("DONE. Region combined files: ", length(list.files(outdir_ccmreg, pattern = "\\_combined.png$")))
+```
