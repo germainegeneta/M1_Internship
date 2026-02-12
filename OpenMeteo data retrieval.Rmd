@@ -1,0 +1,218 @@
+---
+title: "Climate data collection via OpenMeteo ver. 3"
+author: "Germaine Comia Geneta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(purrr)
+library(openmeteo)
+library(ropenmeteo)
+```
+
+# Introduction
+OpenMeteo is an open-source weather API with global-scale climate data. Using its R package `openmeteo`, climate data relative to the entomological dataset can be obtained. The function `weather_history()` allows us to easily retrieve historical weather data, however, there are some limitations. For large, multi-scale, and multi-year datasets such as VectAbundance by Da Re et al. (2024), it may be difficult to simply transpose the variables into the functions. Additionally, OpenMeteo has a request limit of 10,000 APIs per day, 5,000 per hour, and 600 per minute. The climate data retrieval must be done efficiently so as not to overwhelm the API. This pipeline accounts for these limitations while striving to be reproducible for large-scale datasets similar to VectAbundance.
+
+This script is part of a pipeline cross-correlation mapping of climate and entomological data.
+
+# 1. Setting up the entomological data
+The input data must contain at least the sampling date, which will be our end date, or sampling interval and latitude and longitude coordinates. If coordinates are not available, a place name string of the location will suffice. The package, via `geocode()`, provides the coordinates. It is also here that we set the maximum time lag to retrieve the climate data. At this point, it would be best to select the [climate variables](https://open-meteo.com/en/docs/historical-weather-api) to retrieve.
+
+```{r 1}
+# Set name of this dataset
+datasetName <- "VectAbundance_2024"
+
+# Set maximum time lag
+maxLag <- 12
+
+# Set which variable to retrieve
+daily <- "temperature_2m_mean"
+
+# Load from DwC sampling event and create new dataframe with temporal and spatial information
+dwc_event <- read_csv("VectAbundance_2024_event.csv")
+data_clim <- dwc_event |> 
+  transmute(
+    rowID = row_number(),
+    startDate = as.Date(startDate),
+    endDate = as.Date(eventDate),
+    lat = decimalLatitude,
+    long = decimalLongitude,
+    region = stateProvince
+  )
+
+# Create a new output directory
+outdir_clim <- file.path(datasetName, "clim_daily", daily)
+dir.create(outdir_clim, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Dividing into batches, by site and year
+To ensure an efficient retrieval, data will be grouped into batches according to unique sites, i.e., unique pairs of coordinates if not specified. The overall date interval for that site will be determined. For example, date intervals of Site A are:
+
+1. 2020-01-01 to 2020-01-07
+2. 2020-02-01 to 2020-02-07
+3. 2020-02-08 to 2020-02-14
+4.2020-03-01 to 2020-03-07
+
+The earliest date for Site A is 2020-01-01 and the latest date is 2020-03-07. Hence, we will only retrieve the climate data for Site A from 2020-01-01 to 2020-03-07, which counts as 1 API, as opposed to retrieving 4 APIs for each date range. The start date will be adjusted according to the maximum time lag specified in the previous chunk. 
+
+In datasets where the sampling period spans multiple years, batches will be split further by year. So for example, if Site B spans from 2018-2020, we can make 3 separate requests for Site A rather than 1 big request. Additionally, the request date range will automatically be for the whole year. As such, Site B will have requests from 2018-01-01 to 2018-12-31, and so on. These conditions ensure that each site will have a returned climate value, regardless of gaps in collection, and that the lagged periods before sampling are also accounted for. 
+
+```{r 2}
+# Identify unique sites and assign site ID
+sites <- data_clim |> 
+  distinct(lat, long, region) |> 
+  mutate(siteID = row_number())
+
+# Add to dataframe
+data_clim <- data_clim |> 
+  left_join(sites, by = c("lat", "long", "region"))
+
+# Identify start and end dates per site
+siteDates <- data_clim |> 
+  group_by(siteID, lat, long, region) |> 
+  summarise(
+    siteStart = min(startDate, na.rm = TRUE), # earliest sampling start
+    siteEnd   = max(endDate,   na.rm = TRUE), # latest trap date
+    .groups = "drop"
+  )  |> 
+  mutate(
+    startLag = siteStart - weeks(maxLag), # lag-adjusted start
+    yearStart = year(startLag), # full calendar years for requests
+    yearEnd = year(siteEnd)
+  )
+siteDates
+
+# Create site batches based on years
+siteBatch <- siteDates |> 
+  rowwise() |> 
+  mutate(years = list(seq(yearStart, yearEnd))) |> 
+  unnest(years) |> 
+  ungroup() |> 
+  transmute(
+    siteID, lat, long,
+    batchStart = as.character(as.Date(paste0(years, "-01-01"))),
+    batchEnd = as.character(as.Date(paste0(years, "-12-31")))
+  )
+siteBatch
+```
+
+# 3. Retrieving climate data by batch
+Now, we will retrieve the APIs. It is advisable to clear the cache folder before every run.
+```{r 3}
+unlink("openmeteo_cache", recursive = TRUE)
+dir.create("openmeteo_cache", showWarnings = FALSE)
+
+cachePath <- function(siteID, start, end) {
+  file.path("openmeteo_cache", paste0("site_", siteID, "__", start, "__", end, ".rds"))
+}
+
+retrieveBatchCached <- function(lat, long, start, end, siteID,
+                                region = NULL,
+                                maxTries = 8,
+                                baseWait = 0.8,
+                                maxWait  = 60) {
+  f <- cachePath(siteID, start, end)
+  if (file.exists(f)) return(readRDS(f)) # If already downloaded, load from disk
+  wait <- baseWait
+  for (k in seq_len(maxTries)) {
+    Sys.sleep(wait)
+    out <- tryCatch(
+      weather_history( # function from openmeteo package
+        location = c(lat, long),
+        start = start,
+        end   = end,
+        daily = daily #CHECK THISSSSS
+      ),
+      error = function(e) e
+    )
+    if (!inherits(out, "error")) {
+      out$siteID <- siteID
+      out$region <- region
+      out$batchStart <- start
+      out$batchEnd <- end
+      saveRDS(out, f)
+      return(out)
+    }
+    msg <- conditionMessage(out)
+    message("FAILED siteID=", siteID, " ", start, " to ", end, " try=", k, " : ", msg)
+    if (grepl("429", msg)) {
+      wait <- min(max(wait * 2, 2), maxWait)
+    } 
+    else {wait <- min(wait * 1.5, maxWait)}
+  }
+  message("GAVE UP siteID=", siteID, " ", start, " to ", end)
+  NULL
+}
+
+climList <- map(seq_len(nrow(siteBatch)), \(i) {
+  retrieveBatchCached(
+    lat   = siteBatch$lat[i],
+    long  = siteBatch$long[i],
+    start = siteBatch$batchStart[i],
+    end   = siteBatch$batchEnd[i],
+    siteID = siteBatch$siteID[i],
+    region = siteBatch$region[i]
+  )
+})
+
+climSites <- bind_rows(compact(climList))
+
+# Save as .csv for backup
+write.csv(climSites, file = file.path(outdir_clim, paste0(datasetName, "_clim.csv")), row.names = FALSE)
+```
+
+# 4. Compile into a table, with spatial data
+Depending on your purpose for obtaining the climate data, you may opt to stop after saving climSites as a .csv. However, since this dataset is large-scale both temporally and spatially, I prefer to also enjoin the specific coordinates as a reference when processing them later for CCMs.
+
+Make sure to *check the output of climSites for the exact column name of the climate variable*, and replace it in the new dataframe. As a final checking step, run the last line to ensure all dates across all sites have a climate value.
+```{r 4}
+# Create dataframe
+if ("date" %in% names(climSites)) {
+  climDaily <- climSites |>
+    mutate(date = as.Date(date)) |>
+    transmute(
+      siteID,
+      region,
+      date,
+      mean_temp = daily_temperature_2m_mean # change accordingly
+    )
+  } else {
+  dateCol <- intersect(names(climSites), c("time", "datetime", "date_raw"))[1] # fallback if date column is named differently
+  if (is.na(dateCol)) {
+    stop(
+      "Could not find a usable date column in climSites. Columns are: ",
+      paste(names(climSites), collapse = ", ")
+    )
+  }
+
+  climDaily <- climSites |> 
+    rename(dateRaw = all_of(dateCol)) |>
+    mutate(date = as.Date(dateRaw)) |>
+    transmute(
+      siteID,
+      region,
+      date,
+      mean_temp = daily_temperature_2m_mean)
+}
+
+# De-duplicate overlapping year chunks
+climDaily <- climDaily |>
+  distinct(siteID, date, .keep_all = TRUE) |>
+  arrange(siteID, date)
+
+climDailySpatial <- climDaily |>
+  left_join(sites, by = "siteID") 
+
+# Save as .csv
+write.csv(climDailySpatial, file = file.path(outdir_clim, paste0(datasetName, "_climSpatial.csv")), row.names = FALSE)
+
+# Check if all values are present
+message("Missing climate values: ", sum(is.na(climDailySpatial$mean_temp)))
+```
