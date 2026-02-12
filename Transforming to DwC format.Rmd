@@ -15,12 +15,13 @@ library(dplyr)
 library(countrycode)
 library(sf)
 ```
+# Introduction
+The Darwin Core Standard (DwC) is a widely used framework for structuring biodiversity data, including information on biological records, sampling protocols, and their associated metadata, enabling comprehensive documentation of sampling-event or occurrence datasets. Throughout the transformation, we will only use the VectAbundance dataset from [Da Re et al. (2024)](https://zenodo.org/records/11486198) as a sample dataset. 
 
-# Setting up
+# 0. Setting up
+After loading our data, denoted by `r data`, we must check the fields that we have. To be organized when saving and exporting datasets into csv files, we will name each dataset using `r datasetName`. This will appear as a field later in the record-level metadataset.
 
-Throughout the transformation, we will only use the VectAbundance dataset (https://zenodo.org/records/11486198) from Da Re et al. (2024) as a sample dataset. After loading our data, denoted by `r data`, we must check the fields that we have. To be organized when saving and exporting datasets into csv files, we will name each dataset using `r datasetName`. This will appear as a field later in the record-level metadataset.
-
-```{r paged.print=TRUE}
+```{r 0 paged.print=TRUE}
 # Load your data
 data <- read_csv("dwc_vect.csv")
 
@@ -29,9 +30,12 @@ head(data, n = 5)
 
 # Set the dataset name
 datasetName <- "VectAbundance_2024"
+
+# Set output directory to be used for all outputs
+dir.create(datasetName, showWarnings = FALSE)
 ```
 
-# Sampling-event: Transforming datasets to sampling-event DarwinCore format
+# 1. Sampling-event: Transforming datasets to sampling-event DarwinCore format
 *Required DwC fields:*
 
 - eventID 
@@ -77,12 +81,12 @@ However for these datasets, we will be using the following fields in combination
 - institutionCode
 - eventRemarks: to document differences in the ovitrap used by each organisms (sections 'Ovitraps characteristics' in the paper)
 
-## Data review
+## 1.1 Data review
 Inspect the original dataset to ensure the presence and completeness of the fields required by the DwC standard.
 
-## Column mapping and assignment
+## 1.2 Map and assign columns
 Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
-```{r}
+```{r 1.2}
 # eventID
 eventID <- data$ID
 
@@ -233,9 +237,9 @@ eventRemarks <- data |>
   pull(eventRemarks)
 ```
 
-## Creating a new dataframe
+## 1.3 Create new dataframe
 Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
-```{r paged.print=TRUE}
+```{r 1.3 paged.print=TRUE}
 # Create a new dataframe following DwC.
 dwc_event <- data  |> 
   transmute(
@@ -271,7 +275,7 @@ write.csv(
 )
 ```
 
-# Occurrence: Transforming datasets to occurrence DarwinCore format
+# 2. Occurrence: Transforming datasets to occurrence DarwinCore format
 *Required DwC fields:*
 
 - occurrenceID
@@ -320,12 +324,12 @@ Selected fields will be included in the occurrence dataset in combination with o
 - lifeStage
 - occurrenceRemarks
 
-## Data review
+## 2.1 Data review
 Inspect the original dataset to ensure the presence and completeness of the fields required by the DwC standard.
 
-## Column mapping and assignment
+## 2.2 Map and assign columns
 Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
-```{r paged.print=TRUE}
+```{r 2.2 paged.print=TRUE}
 # occurrenceID
 occurrenceID <- data$ID
 
@@ -399,9 +403,9 @@ occurrenceRemarks <- ifelse(
 )
 ```
 
-## Creating a new dataframe
+## 2.3 Create new dataframe
 Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
-```{r paged.print=TRUE}
+```{r 2.3 paged.print=TRUE}
 # Create a new dataframe following DwC.
 dwc_occurrence <- data  |> 
   transmute(
@@ -434,7 +438,7 @@ write.csv(
 )
 ```
 
-# Record-level: Transforming datasets to record-level metadataset DarwinCore format
+# 3. Metadata dataset: Transforming datasets to record-level metadataset DarwinCore format
 *DwC fields:*
 
 - type
@@ -458,14 +462,14 @@ write.csv(
 - dataGeneralizations
 - dynamicProperties
 
-From the dataset and accompanying journal article (https://doi.org/10.1038/s41597-024-03482-y), we will try to extract information and compile into a record-level metadataset. Only fields above that have the available data will be included.
+From the dataset and accompanying [journal article](https://doi.org/10.1038/s41597-024-03482-y), we will try to extract information and compile into a record-level metadataset. Only fields above that have the available data will be included.
 
-## Data review
+## 3.1 Data review
 Inspect the original dataset to ensure the presence and completeness of the fields required by the DwC standard.
 
-## Column mapping and assignment
-
-```{r}
+## 3.2 Map and assign columns
+Identify the columns in the original dataset corresponding to each DwC field. Create objects in preparation for the new columns in the new dataframe, assigning values from the original dataset to the corresponding DwC fields. Ideally, we will only alter the contents of this section of the script and run the next section as is.
+```{r 3.2}
 # type
 type <- "Dataset"
 
@@ -521,9 +525,9 @@ dataGeneralizations <- "Downscaled to 1 week, Aggregated coordinates to center p
 dynamicProperties <- NA
 ```
 
-## Creating a new dataframe
-
-```{r}
+## 3.3 Create new dataframe
+Create the new columns. Ensure consistent data types and formats, such as dates in YYYY-MM-DD format, and categorical values following controlled vocabularies.
+```{r 3.3}
 # Create a new dataframe binding all fields
 dwc_metadata <- data  |> 
   transmute(
